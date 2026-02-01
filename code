@@ -1,0 +1,368 @@
+# Select Runtime Type as T4 GPU before running the notebook
+
+
+!pip install -q "ultralytics>=8.1.0" opencv-python-headless matplotlib kagglehub
+
+import os, cv2, glob, time, numpy as np, random
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+from google.colab import files
+from google.colab.patches import cv2_imshow
+import kagglehub
+
+
+DATASET_DIR = "/content/datasets/license_plate"
+if not os.path.exists(DATASET_DIR):
+    print("Downloading dataset from Kaggle...")
+    path = kagglehub.dataset_download("fareselmenshawii/license-plate-dataset")
+    print("Dataset downloaded at:", path)
+
+    def find_image_dirs(base_dir):
+        image_dirs = []
+        for root, dirs, files in os.walk(base_dir):
+            if "images" in root and any(f.endswith((".jpg", ".png", ".jpeg")) for f in files):
+                image_dirs.append(root)
+        return image_dirs
+
+    image_dirs = find_image_dirs(path)
+    train_img_dir = next((d for d in image_dirs if "train" in d.lower()), None)
+    val_img_dir   = next((d for d in image_dirs if "val" in d.lower()), None)
+
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    yaml_path = "/content/license_plate.yaml"
+    yaml_content = f"""
+train: {train_img_dir}
+val: {val_img_dir}
+
+nc: 1
+names: ['license_plate']
+"""
+    with open(yaml_path, "w") as f:
+        f.write(yaml_content)
+    print("\n📘 YOLO Data Config:")
+    print(open(yaml_path).read())
+else:
+    yaml_path = "/content/license_plate.yaml"
+    print("Dataset already present.")
+
+print("\n📤 Please upload your parking video (.mp4 or .avi)...")
+uploaded = files.upload()
+if not uploaded:
+    raise SystemExit("No video uploaded.")
+video_path = list(uploaded.keys())[0]
+print(f"Uploaded video: {video_path}")
+
+latest_runs = sorted(glob.glob("/content/runs/detect/license_plate_train*/weights/best.pt"))
+if latest_runs:
+    model_path = latest_runs[-1]
+    print(f"Found existing trained model: {model_path}")
+    plate_model_path = model_path
+else:
+    print("No trained model found. Please upload one or allow training...")
+
+    uploaded = files.upload()
+    if uploaded:
+        plate_model_path = list(uploaded.keys())[0]
+        print(f"Uploaded model: {plate_model_path}")
+    else:
+        print("⏳ No upload detected — starting new YOLOv8s training...")
+        model = YOLO("yolov8s.pt")
+        results = model.train(
+            data=yaml_path,
+            epochs=20,
+            imgsz=640,
+            batch=8,
+            device=0,
+            name="license_plate_train"
+        )
+        plate_model_path = sorted(
+            glob.glob(f"/content/runs/detect/license_plate_train*/weights/best.pt")
+        )[-1]
+
+print(f"\n Using license plate model: {plate_model_path}")
+
+# Load models
+vehicle_model = YOLO("yolov8s.pt")         # Vehicle detector
+plate_model   = YOLO(plate_model_path)     # License plate detector
+
+CROP_DIR = "runs/detect/cropped_plates"
+os.makedirs(CROP_DIR, exist_ok=True)
+OUTPUT_PATH = "processed_output.mp4"
+
+vehicle_classes = {'car', 'motorcycle', 'bus', 'truck'}
+MIN_PLATE_CONF = 0.4
+MIN_PLATE_AREA = 200
+IMPROVEMENT_MARGIN = 0.01
+MIN_PLATE_OVERLAP = 0.10
+
+def pyint(x):
+    return int(x) if x is not None else 0
+
+def safe_color_from_id(tid: int):
+    if tid < 0:
+        return (0, 255, 0)
+    r = (60 + (tid * 37) % 195)
+    g = (60 + (tid * 67) % 195)
+    b = (60 + (tid * 97) % 195)
+    return (pyint(b), pyint(g), pyint(r))
+
+def overlap_fraction(inner, outer):
+    xA = max(inner[0], outer[0]); yA = max(inner[1], outer[1])
+    xB = min(inner[2], outer[2]); yB = min(inner[3], outer[3])
+    interW = max(0, xB - xA); interH = max(0, yB - yA)
+    interArea = interW * interH
+    innerArea = max(0, inner[2]-inner[0]) * max(0, inner[3]-inner[1])
+    return 0.0 if innerArea == 0 else interArea / innerArea
+
+def preprocess_display_frame(frame_bgr):
+    """Whole-frame grayscale + adaptive threshold for DISPLAY only."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(
+        denoised, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        15, 5
+    )
+    thresh = cv2.medianBlur(thresh, 3)
+    disp_bgr = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+    return disp_bgr
+
+def preprocess_plate_crop(plate_bgr):
+    """
+    Gentler preprocessing for the cropped license plate:
+      - grayscale
+      - optional small upscale if very tiny
+      - CLAHE contrast
+      - light blur
+      - mild adaptive threshold
+    """
+    gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
+
+    h, w = gray.shape
+    if max(h, w) < 120:
+        gray = cv2.resize(gray, (w*2, h*2), interpolation=cv2.INTER_CUBIC)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    thresh = cv2.adaptiveThreshold(
+        gray_blur, 255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY,
+        11, 2
+    )
+
+    return thresh
+
+best_plate = {}
+cap = cv2.VideoCapture(video_path)
+fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
+cap.release()
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+writer = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (w, h))
+frame_idx, fps_est = 0, 0.0
+unique_ids_seen = set()
+t_prev = time.time()
+final_frame = None
+
+# Slot-counting logic
+TOTAL_SLOTS = 20
+occupied_slots = 0
+counted_ids = set()          # ids already counted as entered
+last_centroid_y = {}         # track y movement per id
+LINE_Y = int(h * 0.65)       # virtual line position
+
+metric_frames = []
+metric_fps = []
+metric_active_vehicles = []
+metric_slots_available = []
+
+for results in vehicle_model.track(
+    source=video_path,
+    stream=True,
+    tracker="bytetrack.yaml",
+    conf=0.25,
+    iou=0.5,
+    persist=True,
+    verbose=False
+):
+    frame_idx += 1
+
+    # original color frame used internally by YOLO
+    color_frame = results.orig_img.copy()
+
+    # thresholded display frame
+    frame = preprocess_display_frame(color_frame)
+
+    active_ids = set()
+
+    # FPS smoothing
+    t_now = time.time()
+    dt = max(t_now - t_prev, 1e-6)
+    fps_inst = 1.0 / dt
+    fps_est = fps_inst if frame_idx == 1 else 0.9 * fps_est + 0.1 * fps_inst
+    t_prev = t_now
+
+    boxes = results.boxes
+    vehicle_boxes = []
+    if boxes is not None and len(boxes) > 0:
+        xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes, "xyxy") else []
+        clsi = boxes.cls.cpu().numpy().astype(int) if hasattr(boxes, "cls") else []
+        confs = boxes.conf.cpu().numpy() if hasattr(boxes, "conf") else []
+        ids_np = boxes.id.cpu().numpy() if hasattr(boxes, "id") and boxes.id is not None else [-1]*len(xyxy)
+        ids = [pyint(i) for i in ids_np]
+        names = results.names if hasattr(results, "names") else {}
+
+        for (x1,y1,x2,y2), ci, score, tid in zip(xyxy, clsi, confs, ids):
+            cname = names.get(pyint(ci), str(pyint(ci))).lower()
+            if cname not in vehicle_classes:
+                continue
+            x1i, y1i, x2i, y2i = map(pyint, [x1, y1, x2, y2])
+
+            # center of the vehicle bbox
+            cx = int((x1i + x2i) / 2)
+            cy = int((y1i + y2i) / 2)
+
+            if tid >= 0:
+                active_ids.add(tid)
+                unique_ids_seen.add(tid)
+                vehicle_boxes.append((tid, [float(x1i), float(y1i), float(x2i), float(y2i)]))
+
+                # SLOT LOGIC: detect crossing line from top to bottom
+                prev_y = last_centroid_y.get(tid, None)
+                if prev_y is not None:
+                    if (prev_y < LINE_Y) and (cy >= LINE_Y) and (tid not in counted_ids):
+                        counted_ids.add(tid)
+                        occupied_slots = min(occupied_slots + 1, TOTAL_SLOTS)
+                last_centroid_y[tid] = cy
+
+            color = safe_color_from_id(tid)
+            cv2.rectangle(frame, (x1i, y1i), (x2i, y2i), color, 2)
+            cv2.putText(frame, f"{cname} id={tid if tid>=0 else '-'} {float(score):.2f}",
+                        (x1i, max(20, y1i-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+    # Plate detection (using original color frame)
+    plates = plate_model.predict(source=color_frame, conf=MIN_PLATE_CONF, imgsz=640, verbose=False)
+    for pr in plates:
+        if not hasattr(pr, "boxes") or pr.boxes is None:
+            continue
+        xyxy_arr = pr.boxes.xyxy.cpu().numpy()
+        confs_arr = pr.boxes.conf.cpu().numpy().reshape(-1)
+        for box_coords, conf_score in zip(xyxy_arr, confs_arr):
+            px1, py1, px2, py2 = map(pyint, box_coords)
+            if (px2 - px1) * (py2 - py1) < MIN_PLATE_AREA:
+                continue
+
+            best_tid, best_ofrac = -1, 0.0
+            for tid, car_bbox in vehicle_boxes:
+                ofrac = overlap_fraction([px1, py1, px2, py2], car_bbox)
+                if ofrac > best_ofrac:
+                    best_ofrac, best_tid = ofrac, tid
+
+            if best_tid == -1 or best_ofrac < MIN_PLATE_OVERLAP:
+                continue
+
+            plate_crop_color = color_frame[py1:py2, px1:px2]
+            if plate_crop_color.size == 0:
+                continue
+
+            processed_plate = preprocess_plate_crop(plate_crop_color)
+
+            prev = best_plate.get(best_tid)
+            if prev is None or conf_score > prev["conf"] + IMPROVEMENT_MARGIN:
+                base_name = os.path.join(CROP_DIR, f"plate_{best_tid}")
+
+                # save original crop
+                orig_path = base_name + "_orig.jpg"
+                cv2.imwrite(orig_path, plate_crop_color)
+
+                # save processed (high-contrast) version
+                proc_path = base_name + "_proc.jpg"
+                cv2.imwrite(proc_path, processed_plate)
+
+                best_plate[best_tid] = {
+                    "conf": float(conf_score),
+                    "orig": orig_path,
+                    "proc": proc_path
+                }
+
+                cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 255), 2)
+                cv2.putText(frame, f"plate id={best_tid} {conf_score:.2f}",
+                            (px1, max(20, py1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    # draw very light virtual line
+    cv2.line(frame, (0, LINE_Y), (w, LINE_Y), (190, 190, 190), 1)
+
+    cv2.rectangle(frame, (10, 10), (460, 160), (0, 0, 0), -1)
+    cv2.putText(frame, f"Active vehicles (tracked):: {len(active_ids)}", (20, 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, f"Unique vehicles seen: {len(unique_ids_seen)}", (20, 76),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 255, 180), 2)
+
+    slots_available = max(TOTAL_SLOTS - occupied_slots, 0)
+    cv2.putText(frame, f"Slots available: {slots_available}", (20, 110),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 220, 255), 2)
+
+    cv2.putText(frame, f"FPS: {fps_est:.1f}", (20, 144),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
+    # log metrics for plotting later
+    metric_frames.append(frame_idx)
+    metric_fps.append(fps_est)
+    metric_active_vehicles.append(len(active_ids))
+    metric_slots_available.append(slots_available)
+
+    writer.write(frame)
+    final_frame = frame  # save the latest processed frame
+
+writer.release()
+
+if metric_frames:
+    plt.figure(figsize=(10, 6))
+
+    plt.subplot(3, 1, 1)
+    plt.plot(metric_frames, metric_fps)
+    plt.title("Runtime FPS over frames")
+    plt.ylabel("FPS")
+
+    plt.subplot(3, 1, 2)
+    plt.plot(metric_frames, metric_active_vehicles)
+    plt.title("Active vehicles tracked over frames")
+    plt.ylabel("Count")
+
+    plt.subplot(3, 1, 3)
+    plt.plot(metric_frames, metric_slots_available)
+    plt.title("Slots available over frames")
+    plt.xlabel("Frame")
+    plt.ylabel("Slots")
+
+    plt.tight_layout()
+    plt.savefig("runtime_metrics.png", dpi=300)
+    plt.show()
+    print("Saved metrics figure: runtime_metrics.png")
+else:
+    print("No metrics collected (no frames processed).")
+
+# show last frame
+if final_frame is not None:
+    plt.figure(figsize=(10, 6))
+    plt.imshow(cv2.cvtColor(final_frame, cv2.COLOR_BGR2RGB))
+    plt.axis("off")
+    plt.show()
+else:
+    print(" No frame captured — check input video.")
+
+print("\nProcessing complete.")
+print(f"Cropped plates folder: {CROP_DIR}")
+print(f"Output video: {OUTPUT_PATH}")
+
+# Download key outputs
+files.download(OUTPUT_PATH)
+if os.path.exists("runtime_metrics.png"):
+    files.download("runtime_metrics.png")
